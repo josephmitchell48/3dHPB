@@ -1,0 +1,2 @@
+[console_scripts]
+hpbviz = hpbviz.app:main

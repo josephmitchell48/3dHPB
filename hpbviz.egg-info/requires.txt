@@ -1,0 +1,7 @@
+numpy
+SimpleITK
+pydicom
+napari[all]
+scikit-image
+pyvista
+magicgui

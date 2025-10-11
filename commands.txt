@@ -1,0 +1,10 @@
+### FULL RUN
+TOTALSEG_HOME_DIR=$PWD/.totalseg_cache python -m hpbviz.app "/Users/josephmitchell/dev/repos/3dHBP/3Dircadb1.1/PATIENT_DICOM" --export liver.obj 
+
+### SAVE MASK FOR UI RUNs
+TOTALSEG_HOME_DIR=$PWD/.totalseg_cache python -m hpbviz.app "/Users/josephmitchell/dev/repos/3dHBP/3Dircadb1.1/PATIENT_DICOM" --save-mask liver.nii.gz --export liver.obj --no-gui
+
+### UI RUN (No Data Processing)
+TOTALSEG_HOME_DIR=$PWD/.totalseg_cache python -m hpbviz.app "/Users/josephmitchell/dev/repos/3dHBP/3Dircadb1.1/PATIENT_DICOM" --liver-mask /path/to/liver.nii.gz --no-gui
+
+

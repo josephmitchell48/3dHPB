@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: hpbviz
+Version: 0.0.1
+Summary: HPB 3D Visualizer MVP
+Requires-Python: >=3.11
+Requires-Dist: numpy
+Requires-Dist: SimpleITK
+Requires-Dist: pydicom
+Requires-Dist: napari[all]
+Requires-Dist: scikit-image
+Requires-Dist: pyvista
+Requires-Dist: magicgui
