@@ -5,6 +5,46 @@ TOTALSEG_HOME_DIR=$PWD/.totalseg_cache python -m hpbviz.app "/Users/josephmitche
 TOTALSEG_HOME_DIR=$PWD/.totalseg_cache python -m hpbviz.app "/Users/josephmitchell/dev/repos/3dHBP/3Dircadb1.1/PATIENT_DICOM" --save-mask liver.nii.gz --export liver.obj --no-gui
 
 ### UI RUN (No Data Processing)
-TOTALSEG_HOME_DIR=$PWD/.totalseg_cache python -m hpbviz.app "/Users/josephmitchell/dev/repos/3dHBP/3Dircadb1.1/PATIENT_DICOM" --liver-mask /path/to/liver.nii.gz --no-gui
+TOTALSEG_HOME_DIR=$PWD/.totalseg_cache python -m hpbviz.app "/Users/josephmitchell/dev/repos/3dHBP/3Dircadb1.1/PATIENT_DICOM" --liver-mask liver.nii.gz
 
+python -m hpbviz.app "/Users/josephmitchell/dev/repos/3dHBP/data/test_patient1_DICOM" \
+  --liver-mask case_liver.nii.gz \
+  --task008-mask case_task008.nii.gz
 
+python -m hpbviz.remote ./data/test_patient1_DICOM --output prepared_cases --zip
+
+###AWS 
+sudo shutdown -h now
+
+source ~/.hpb/bin/activate
+export RESULTS_FOLDER=/models/results_v1
+uvicorn server:app --host 0.0.0.0 --port 8080
+
+#Connect to aws
+ssh -i ./security/3dhpb-key.pem ubuntu@23.20.247.26
+
+#move local files to AWS
+scp -i ./security/3dhpb-key.pem ./awsServer/server.py ubuntu@23.20.247.26:~/server.py
+
+#AWS health check
+curl http://23.20.247.26:8080/healthz
+
+curl http://23.20.247.26:8080/version
+
+#AWS Task008 run
+
+curl -X POST "http://23.20.247.26:8080/segment/task008?folds=0" \
+  -F "ct=@./prepared_cases/test_patient1_DICOM/test_patient1_DICOM_0000.nii.gz" \
+  -o case_task008.nii.gz
+
+#AWS TotalSegmentator Liver run
+
+curl -X POST "http://23.20.247.26:8080/segment/liver" \
+  -F "ct=@./prepared_cases/test_patient1_DICOM/test_patient1_DICOM.nii.gz" \
+  -o case_liver.nii.gz
+
+#AWS Both Models run
+
+curl -X POST "http://98.83.160.47:8080/segment/both?folds=0&fast=true" \
+  -F "ct=@$(pwd)/liver.nii.gz" \
+  -o case_results.zip

@@ -1,2 +1,12 @@
-/.totalseg_cache
+# Virtual environment & secrets
 /.venv
+/security/
+
+# Datasets & generated assets
+/data/
+
+# Legacy local caches (keep ignored if regenerated)
+/.nnunet/
+/.totalseg_cache/
+
+/commands.txt

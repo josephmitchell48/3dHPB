@@ -15,8 +15,9 @@ class HpbViewer:
         self.volume_name = volume_name
         self.viewer: Optional[napari.Viewer] = None
         self._volume_data: Optional[np.ndarray] = None
-        self._liver_mesh_world: Optional[Dict[str, Any]] = None
-        self._abdomen_mesh_world: Optional[Dict[str, Any]] = None
+        self.surface_layers: Dict[str, napari.layers.Surface] = {}
+        self._surface_meshes_world: Dict[str, Dict[str, Any]] = {}
+        self._controls_dock = None
 
         sx, sy, sz = image.GetSpacing()
         self.spacing_xyz = (float(sx), float(sy), float(sz))
@@ -26,8 +27,6 @@ class HpbViewer:
         self.direction = np.array(image.GetDirection(), dtype=np.float64).reshape(3, 3)
 
         self.vol_layer = None
-        self.liver_layer = None
-        self.abdo_layer = None
         self._mesher = MeshBuilder()
 
     # ---------- public entry points ----------
@@ -35,54 +34,29 @@ class HpbViewer:
     def show(self):
         """Open the viewer with just the CT volume."""
         self._ensure_viewer()
+        self._setup_controls()
         napari.run()
 
-    def show_with_surface(self, surface: Dict[str, Any], build_abdomen: bool = True, hide_volume: bool = False):
-        """
-        Open the viewer, add the liver surface, and optionally build a full-abdomen surface.
-        """
+    def show_with_surfaces(
+        self,
+        surfaces: Dict[str, Dict[str, Any]],
+        build_abdomen: bool = True,
+        hide_volume: bool = False,
+    ):
+        """Open the viewer, add multiple surfaces, and optionally build a context abdomen surface."""
         self._ensure_viewer()
 
-        # Liver mesh
-        verts = np.asarray(surface["vertices"], dtype=np.float32)
-        faces = np.asarray(surface["faces"], dtype=np.int32)
-        if verts.size and faces.size:
-            self._liver_mesh_world = {"vertices": verts, "faces": faces}
-            verts_napari = self._world_to_data_coords(verts)
-            self.liver_layer = self.viewer.add_surface(
-                (verts_napari, faces),
-                name="Liver",
-                opacity=0.95,
-                shading="smooth",
-            )
-            self.liver_layer.scale = self.spacing_zyx
-            # Make it pop
-            try:
-                self.liver_layer.face_color = [0.1, 0.8, 0.2, 1.0]  # RGBA
-            except Exception:
-                pass
+        self._add_surfaces(surfaces, clear_existing=True)
 
         # Optional: full-abdomen surface
         if build_abdomen:
             try:
                 abdo = self._build_abdomen_surface()
                 if abdo is not None:
-                    self._abdomen_mesh_world = abdo
-                    abdo_napari = {
-                        "vertices": self._world_to_data_coords(abdo["vertices"]),
-                        "faces": abdo["faces"],
-                    }
-                    self.abdo_layer = self.viewer.add_surface(
-                        (abdo_napari["vertices"], abdo_napari["faces"]),
-                        name="Abdomen",
-                        opacity=0.25,
-                        shading="flat",
-                    )
-                    self.abdo_layer.scale = self.spacing_zyx
-                    try:
-                        self.abdo_layer.face_color = [0.6, 0.6, 0.6, 1.0]
-                    except Exception:
-                        pass
+                    abdo.setdefault("color", (0.6, 0.6, 0.6, 1.0))
+                    abdo.setdefault("opacity", 0.25)
+                    abdo.setdefault("display_name", "Abdomen")
+                    self._add_surfaces({"abdomen": abdo})
             except Exception as e:
                 print(f"[viewer] Abdomen surface build failed: {e}")
 
@@ -93,6 +67,7 @@ class HpbViewer:
         # Switch to 3D and center
         self.viewer.dims.ndisplay = 3
         self.viewer.reset_view()
+        self._setup_controls()
         napari.run()
 
     # ---------- internal helpers ----------
@@ -118,7 +93,62 @@ class HpbViewer:
             visible=True,
         )
 
-        self.viewer.window.add_dock_widget(self._controls_widget(), area="right")
+    def _setup_controls(self) -> None:
+        if self.viewer is None:
+            return
+        if self._controls_dock is not None:
+            try:
+                self.viewer.window.remove_dock_widget(self._controls_dock)
+            except Exception:
+                pass
+            self._controls_dock = None
+        widget = self._controls_widget()
+        self._controls_dock = self.viewer.window.add_dock_widget(widget, area="right")
+
+    def _add_surfaces(self, surfaces: Dict[str, Dict[str, Any]], clear_existing: bool = False) -> None:
+        if self.viewer is None:
+            return
+
+        if clear_existing:
+            for layer in self.surface_layers.values():
+                try:
+                    self.viewer.layers.remove(layer)
+                except Exception:
+                    pass
+            self.surface_layers.clear()
+            self._surface_meshes_world.clear()
+
+        for key, surface in surfaces.items():
+            if not surface:
+                continue
+            verts = np.asarray(surface["vertices"], dtype=np.float32)
+            faces = np.asarray(surface["faces"], dtype=np.int32)
+            if verts.size == 0 or faces.size == 0:
+                continue
+            verts_napari = self._world_to_data_coords(verts)
+            display_name = surface.get("display_name") or key.replace("_", " ").title()
+            opacity = surface.get("opacity", 0.9)
+            shading = surface.get("shading", "smooth")
+
+            layer = self.viewer.add_surface(
+                (verts_napari, faces),
+                name=display_name,
+                opacity=opacity,
+                shading=shading,
+            )
+            layer.scale = self.spacing_zyx
+            color = surface.get("color")
+            if color is not None:
+                try:
+                    layer.face_color = color
+                except Exception:
+                    pass
+
+            self.surface_layers[display_name] = layer
+            self._surface_meshes_world[display_name] = {
+                "vertices": verts,
+                "faces": faces,
+            }
 
     def _build_abdomen_surface(self) -> Optional[Dict[str, Any]]:
         """
@@ -154,40 +184,10 @@ class HpbViewer:
                 return
             self.vol_layer.visible = not self.vol_layer.visible
 
-        @magicgui(call_button="Toggle Liver Mesh")
-        def toggle_liver():
-            if self.liver_layer is None:
-                print("No liver surface layer.")
-                return
-            self.liver_layer.visible = not self.liver_layer.visible
-
-        @magicgui(call_button="Toggle Abdomen Mesh")
-        def toggle_abdomen():
-            if self.abdo_layer is None:
-                print("No abdomen surface layer.")
-                return
-            self.abdo_layer.visible = not self.abdo_layer.visible
-
         @magicgui(call_button="Center View")
         def center_view():
             self.viewer.dims.ndisplay = 3
             self.viewer.reset_view()
-
-        @magicgui(call_button="Export Liver Mesh")
-        def export_liver(path: str = "liver.obj"):
-            if self._liver_mesh_world is None:
-                print("No liver mesh to export.")
-                return
-            save_mesh(self._liver_mesh_world, path)
-            print(f"Saved {path}")
-
-        @magicgui(call_button="Export Abdomen Mesh")
-        def export_abdomen(path: str = "abdomen.obj"):
-            if self._abdomen_mesh_world is None:
-                print("No abdomen mesh to export.")
-                return
-            save_mesh(self._abdomen_mesh_world, path)
-            print(f"Saved {path}")
 
         @magicgui(call_button="Save Screenshot")
         def save_screenshot(path: str = "viewer.png"):
@@ -199,11 +199,39 @@ class HpbViewer:
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.addWidget(toggle_volume.native)
-        layout.addWidget(toggle_liver.native)
-        layout.addWidget(toggle_abdomen.native)
         layout.addWidget(center_view.native)
-        layout.addWidget(export_liver.native)
-        layout.addWidget(export_abdomen.native)
+
+        for name in sorted(self.surface_layers.keys()):
+            layer = self.surface_layers[name]
+            mesh_world = self._surface_meshes_world.get(name)
+            label = name
+
+            def make_toggle(target_layer=layer, display_name=label):
+                @magicgui(call_button=f"Toggle {display_name}")
+                def toggle():
+                    if target_layer is None:
+                        print(f"No {display_name} surface layer.")
+                        return
+                    target_layer.visible = not target_layer.visible
+                return toggle
+
+            toggle_widget = make_toggle()
+            layout.addWidget(toggle_widget.native)
+
+            if mesh_world is not None:
+                def make_export(mesh=mesh_world, display_name=label):
+                    default_name = display_name.lower().replace(" ", "_") + ".obj"
+
+                    @magicgui(call_button=f"Export {display_name} Mesh")
+                    def export(path: str = default_name):
+                        save_mesh(mesh, path)
+                        print(f"Saved {path}")
+
+                    return export
+
+                export_widget = make_export()
+                layout.addWidget(export_widget.native)
+
         layout.addWidget(save_screenshot.native)
         return w
 

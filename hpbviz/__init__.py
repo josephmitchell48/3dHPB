@@ -1,2 +1,11 @@
 
-__all__ = ["io", "preprocess", "segment", "mesh", "viewer", "app"]
+__all__ = [
+    "io",
+    "preprocess",
+    "segment",
+    "mesh",
+    "viewer",
+    "app",
+    "remote",
+    "remote_client",
+]

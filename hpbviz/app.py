@@ -35,8 +35,9 @@ def run_pipeline(
     series_uid: str | None = None,
     liver_mask_path: str | None = None,
     save_mask_path: str | None = None,
+    task008_mask_path: str | None = None,
 ):
-    """Run segmentation + meshing pipeline or load a precomputed mask."""
+    """Run segmentation + meshing pipeline or load precomputed masks."""
     img = load_dicom_series(input_path, series_uid=series_uid)  # DICOM dir, single DICOM file, or NIfTI
 
     if liver_mask_path:
@@ -47,19 +48,45 @@ def run_pipeline(
         result = AutoLiver().run(img)
         mask_img = result.mask
 
-    mask_np = (sitk.GetArrayFromImage(mask_img) > 0).astype(np.uint8)  # z,y,x
-    sx, sy, sz = mask_img.GetSpacing()
-    origin = mask_img.GetOrigin()
-    surface = MeshBuilder().mask_to_surface(mask_np, spacing=(sx, sy, sz), origin=origin)
-
-    if export_path:
-        save_mesh(surface, export_path)
-
     if save_mask_path:
         sitk.WriteImage(mask_img, save_mask_path)
         print(f"[pipeline] saved liver mask to {save_mask_path}")
 
-    return img, surface, result
+    mesh_builder = MeshBuilder()
+    surfaces: dict[str, dict[str, np.ndarray]] = {}
+
+    mask_np = (sitk.GetArrayFromImage(mask_img) > 0).astype(np.uint8)  # z,y,x
+    sx, sy, sz = mask_img.GetSpacing()
+    origin = mask_img.GetOrigin()
+    liver_surface = mesh_builder.mask_to_surface(mask_np, spacing=(sx, sy, sz), origin=origin)
+    liver_surface["color"] = (0.1, 0.8, 0.2, 1.0)
+    surfaces["liver"] = liver_surface
+
+    if task008_mask_path:
+        t8_img = sitk.Cast(sitk.ReadImage(task008_mask_path), sitk.sitkUInt8)
+        t8_img = _resample_mask_to_image(t8_img, img)
+        t8_np = sitk.GetArrayFromImage(t8_img).astype(np.uint8)
+        t8_spacing = t8_img.GetSpacing()
+        t8_origin = t8_img.GetOrigin()
+        label_map = {
+            1: ("hepatic_vessels", (0.9, 0.3, 0.3, 1.0)),
+            2: ("liver_tumors", (0.8, 0.6, 0.1, 1.0)),
+        }
+        for label, (name, color) in label_map.items():
+            if np.any(t8_np == label):
+                surface = mesh_builder.mask_to_surface(
+                    t8_np,
+                    spacing=tuple(t8_spacing),
+                    origin=tuple(t8_origin),
+                    label=label,
+                )
+                surface["color"] = color
+                surfaces[name] = surface
+
+    if export_path and "liver" in surfaces:
+        save_mesh(surfaces["liver"], export_path)
+
+    return img, surfaces, result
 
 
 def main():
@@ -78,6 +105,11 @@ def main():
         help="Optional path to save the liver mask (NIfTI). Useful for dev mode.",
         default=None,
     )
+    p.add_argument(
+        "--task008-mask",
+        help="Path to nnU-Net v1 Task008 output (NIfTI).",
+        default=None,
+    )
     p.add_argument("--list-series", action="store_true", help="List DICOM series in the given folder and exit")
     args = p.parse_args()
 
@@ -92,19 +124,20 @@ def main():
             print(f"  UID={s['uid']}  ({s['count']} files){desc}")
         return
 
-    img, surface, result = run_pipeline(
+    img, surfaces, result = run_pipeline(
         args.input,
         args.export,
         series_uid=args.series,
         liver_mask_path=args.liver_mask,
         save_mask_path=args.save_mask,
+        task008_mask_path=args.task008_mask,
     )
     print(f"[pipeline] method={result.used}, phase_hint={result.phase_hint}")
 
     if not args.no_gui:
         from .viewer import HpbViewer
 
-        HpbViewer(image=img).show_with_surface(surface)
+        HpbViewer(image=img).show_with_surfaces(surfaces)
 
 
 if __name__ == "__main__":
