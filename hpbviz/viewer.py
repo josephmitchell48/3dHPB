@@ -1,7 +1,10 @@
 # viewer.py
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, Callable, Tuple
+import os
+import re
+from pathlib import Path
+from typing import Optional, Dict, Any, Callable, Tuple, List
 
 import numpy as np
 import SimpleITK as sitk
@@ -10,6 +13,12 @@ from magicgui import magicgui
 from napari.utils.colormaps import Colormap
 from qtpy.QtCore import Qt, QSignalBlocker
 from qtpy.QtWidgets import QListWidget, QWidget, QVBoxLayout, QLabel, QFrame
+
+_NAPARI_CACHE = Path.cwd() / ".napari_cache"
+_NAPARI_CACHE.mkdir(parents=True, exist_ok=True)
+os.environ["NAPARI_CACHE_DIR"] = str(_NAPARI_CACHE)
+os.environ["NAPARI_CONFIG_DIR"] = str(_NAPARI_CACHE)
+os.environ["NAPARI_CONFIG"] = str(_NAPARI_CACHE)
 
 from .io import save_mesh
 from .mesh import MeshBuilder
@@ -297,7 +306,7 @@ class HpbViewer:
         layout = QVBoxLayout(widget)
         layout.addWidget(center_view.native)
 
-        for name in sorted(self.surface_layers.keys()):
+        for name in self._sorted_layer_names():
             mesh_world = self._surface_meshes_world.get(name)
             if not mesh_world:
                 continue
@@ -331,3 +340,9 @@ class HpbViewer:
             return f"{self.volume_name} ({self.current_case})"
         return self.volume_name
 
+    def _sorted_layer_names(self) -> List[str]:
+        def sort_key(name: str):
+            parts = re.split(r"(\d+)", name)
+            return [int(part) if part.isdigit() else part.lower() for part in parts]
+
+        return sorted(self.surface_layers.keys(), key=sort_key)
