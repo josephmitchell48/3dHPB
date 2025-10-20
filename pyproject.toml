@@ -8,13 +8,16 @@ version = "0.0.1"
 description = "HPB 3D Visualizer MVP"
 requires-python = ">=3.11"
 dependencies = [
-  "numpy",
   "SimpleITK",
-  "pydicom",
+  "magicgui",
   "napari[all]",
-  "scikit-image",
+  "numpy",
+  "pydicom",
   "pyvista",
-  "magicgui"
+  "qtpy",
+  "requests",
+  "scikit-image",
+  "vtk",
 ]
 
 [project.scripts]

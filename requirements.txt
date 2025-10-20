@@ -1,0 +1,11 @@
+# Dependencies needed to run hpbviz
+SimpleITK
+magicgui
+napari[all]
+numpy
+pydicom
+pyvista
+requests
+scikit-image
+qtpy
+vtk
