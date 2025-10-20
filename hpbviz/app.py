@@ -1,14 +1,39 @@
 import argparse
+import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Tuple
+
 import SimpleITK as sitk
 import numpy as np
 
-from .segment import AutoLiver, AutoLiverResult
 from .mesh import MeshBuilder
 from .io import load_dicom_series, save_mesh, list_dicom_series
 
+log = logging.getLogger("hpbviz.pipeline")
+if not log.handlers:
+    # Minimal default handler; feel free to configure elsewhere.
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
+log.setLevel(logging.INFO)
+
+RGBA = Tuple[float, float, float, float]
+
+# ---- Label/color config ------------------------------------------------------
+
+TASK08_LABELS: Dict[int, Tuple[str, RGBA]] = {
+    1: ("hepatic_vessels", (0.0, 0.0, 1.0, 1.0)),
+    2: ("liver_tumors",    (0.0, 1.0, 0.0, 1.0)),
+}
+
+VSNET_LABELS: Dict[int, Tuple[str, RGBA]] = {
+    1: ("pulmonary_vein", (0.25, 0.40, 0.95, 0.85)),
+    2: ("hepatic_vein",   (0.10, 0.75, 0.85, 0.80)),
+}
+
+# ---- Core utilities ----------------------------------------------------------
 
 def _resample_mask_to_image(mask: sitk.Image, reference: sitk.Image) -> sitk.Image:
     same_geometry = (
@@ -40,6 +65,85 @@ def _canonicalize_image(image: sitk.Image) -> sitk.Image:
     oriented.SetOrigin((0.0, 0.0, 0.0))
     return oriented
 
+
+def _read_mask_like(ref_img: sitk.Image, path: str) -> sitk.Image:
+    """
+    Read a mask file, cast to uint8, resample onto ref_img grid, canonicalize once.
+    """
+    m = sitk.Cast(sitk.ReadImage(path), sitk.sitkUInt8)
+    m = _resample_mask_to_image(m, ref_img)
+    return _canonicalize_image(m)
+
+
+def _build_surface(
+    mesh_builder: MeshBuilder,
+    mask_img: sitk.Image,
+    name: str,
+    color: RGBA,
+    label: Optional[int] = None,
+) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Centralized meshing with correct axis/spacing handling and guardrails.
+    Returns a dict compatible with your viewer: {'vertices','faces','color', ...}
+    """
+    arr = sitk.GetArrayFromImage(mask_img).astype(np.uint8)  # (z, y, x)
+    if label is None:
+        mask_arr = (arr > 0).astype(np.uint8)
+    else:
+        mask_arr = (arr == label).astype(np.uint8)
+    if not np.any(mask_arr):
+        log.info("[mesh] '%s' is empty (label=%s)", name, label)
+        return None
+
+    spacing = mask_img.GetSpacing()
+    origin = mask_img.GetOrigin()
+    try:
+        mesh = mesh_builder.mask_to_surface(
+            mask_arr,
+            spacing=spacing,
+            origin=origin,
+            label=None,
+        )
+    except ValueError as e:
+        log.warning("[mesh] '%s' marching cubes failed: %s", name, e)
+        return None
+
+    v = mesh.get("vertices", np.array([]))
+    f = mesh.get("faces", np.array([]))
+    if v.size == 0 or f.size == 0:
+        log.info("[mesh] '%s' produced empty geometry", name)
+        return None
+
+    mesh["color"] = color
+    mesh.setdefault("color", color)
+    mesh.setdefault("display_name", name)
+    return mesh
+
+def _add_labeled_surfaces(
+    *,
+    mesh_builder: MeshBuilder,
+    ref_img: sitk.Image,
+    mask_path: Optional[str],
+    label_map: Dict[int, Tuple[str, RGBA]],
+    surfaces: Dict[str, Dict[str, np.ndarray]],
+    log_tag: str,
+    set_display_name: bool = False,
+) -> None:
+    """Common routine to read a multi-label mask, log present labels, and add surfaces."""
+    if not mask_path:
+        return
+    m_img = _read_mask_like(ref_img, mask_path)
+    arr = sitk.GetArrayFromImage(m_img)
+    present = sorted(int(v) for v in np.unique(arr) if int(v) in label_map)
+    log.info("[pipeline] %s labels present: %s", log_tag, present)
+
+    for label, (name, color) in label_map.items():
+        s = _build_surface(mesh_builder, m_img, name=name, color=color, label=label)
+        if s:
+            if set_display_name:
+                s["display_name"] = name.replace("_", " ").title()
+            surfaces[name] = s
+# ---- Case discovery helpers --------------------------------------------------
 
 def _case_name_from_path(path: str) -> str:
     name = Path(path.rstrip("/"))
@@ -91,7 +195,7 @@ def _discover_cases(raw_root: str, output_root: str) -> dict[str, dict[str, str]
                     liver_mask = str(candidate.resolve())
                 elif ("task008" in name_lower or "hepatic" in name_lower or "tumor" in name_lower) and task008_mask is None:
                     task008_mask = str(candidate.resolve())
-                elif ("input_mask" in name_lower or "manual" in name_lower) and manual_mask is None:
+                elif ("vsnet" in name_lower or "inputvsnet" in name_lower) and manual_mask is None:
                     manual_mask = str(candidate.resolve())
             entry = cases.setdefault(case, {})
             if liver_mask:
@@ -103,6 +207,7 @@ def _discover_cases(raw_root: str, output_root: str) -> dict[str, dict[str, str]
 
     return {case: info for case, info in cases.items() if info.get("dicom_path")}
 
+# ---- Pipeline ---------------------------------------------------------------
 
 def run_pipeline(
     input_path: str,
@@ -113,112 +218,67 @@ def run_pipeline(
     task008_mask_path: str | None = None,
     manual_mask_path: str | None = None,
 ):
-    """Run segmentation + meshing pipeline or load precomputed masks."""
-    img = load_dicom_series(input_path, series_uid=series_uid)  # DICOM dir, single DICOM file, or NIfTI
-    img = _canonicalize_image(img)
+    """
+    Run meshing pipeline with provided masks (no local segmentation).
+    Returns: (img, surfaces, mask_img) for viewer compatibility.
+    """
+    # 1) Load & canonicalize reference image once
+    img = _canonicalize_image(load_dicom_series(input_path, series_uid=series_uid))
 
-    if liver_mask_path:
-        mask_img = sitk.Cast(sitk.ReadImage(liver_mask_path), sitk.sitkUInt8)
-        mask_img = _resample_mask_to_image(mask_img, img)
-        result = AutoLiverResult(mask=mask_img, phase_hint="unknown", used="precomputed")
-    else:
-        result = AutoLiver().run(img)
-        mask_img = result.mask
-
-    mask_img = _canonicalize_image(mask_img)
+    # 2) Liver mask is required (no AutoLiver fallback)
+    if not liver_mask_path:
+        raise RuntimeError("Liver mask is required. No local segmentation fallback is available.")
+    mask_img = _read_mask_like(img, liver_mask_path)
 
     if save_mask_path:
         sitk.WriteImage(mask_img, save_mask_path)
-        print(f"[pipeline] saved liver mask to {save_mask_path}")
+        log.info("[pipeline] saved liver mask to %s", save_mask_path)
 
+    # 3) Build surfaces via shared helper
     mesh_builder = MeshBuilder()
     surfaces: dict[str, dict[str, np.ndarray]] = {}
 
-    mask_img = _canonicalize_image(mask_img)
-    mask_np = (sitk.GetArrayFromImage(mask_img) > 0).astype(np.uint8)  # z,y,x
-    sx, sy, sz = mask_img.GetSpacing()
-    origin = mask_img.GetOrigin()
-    try:
-        liver_surface = mesh_builder.mask_to_surface(mask_np, spacing=(sx, sy, sz), origin=origin)
-        liver_surface["color"] = (1, 0.0, 0.0, 1.0)
+    # Liver
+    liver_surface = _build_surface(mesh_builder, mask_img, name="liver", color=(1.0, 0.0, 0.0, 1.0))
+    if liver_surface:
         surfaces["liver"] = liver_surface
-    except ValueError:
-        pass
+    else:
+        log.info("[pipeline] liver surface empty")
 
-    if task008_mask_path:
-        t8_img = sitk.Cast(sitk.ReadImage(task008_mask_path), sitk.sitkUInt8)
-        t8_img = _resample_mask_to_image(t8_img, img)
-        t8_img = _canonicalize_image(t8_img)
-        t8_np = sitk.GetArrayFromImage(t8_img).astype(np.uint8)
-        t8_spacing = t8_img.GetSpacing()
-        t8_origin = t8_img.GetOrigin()
-        label_map = {
-            1: ("hepatic_vessels", (0.0, 0.0, 1.0, 1.0)),
-            2: ("liver_tumors", (0.0, 1.0, 0.0, 1.0)),
-        }
-        for label, (name, color) in label_map.items():
-            
-            print("label: ", label)
-            print( "data: ",t8_np)
+    # Task08 (optional)
+    _add_labeled_surfaces(
+        mesh_builder=mesh_builder,
+        ref_img=img,
+        mask_path=task008_mask_path,
+        label_map=TASK08_LABELS,
+        surfaces=surfaces,
+        log_tag="Task08",
+        set_display_name=True,  # keep previous behavior
+    )
 
+    # VSNet/manual (optional)
+    _add_labeled_surfaces(
+        mesh_builder=mesh_builder,
+        ref_img=img,
+        mask_path=manual_mask_path,
+        label_map=VSNET_LABELS,
+        surfaces=surfaces,
+        log_tag="VSNet",
+        set_display_name=True,   # match your previous manual block
+    )
 
-            if np.any(t8_np == label):
-                try:
-                    surface = mesh_builder.mask_to_surface(
-                        t8_np,
-                        spacing=tuple(t8_spacing),
-                        origin=tuple(t8_origin),
-                        label=label,
-                    )
-                    surface["color"] = color
-                    surfaces[name] = surface
-                except ValueError:
-                    pass
-        print("coming here 1")
-
-    if manual_mask_path:
-        manual_img = sitk.Cast(sitk.ReadImage(manual_mask_path), sitk.sitkUInt8)
-        manual_img = _resample_mask_to_image(manual_img, img)
-        manual_img = _canonicalize_image(manual_img)
-        manual_np = sitk.GetArrayFromImage(manual_img).astype(np.int16)
-
-        label_palette = {
-            1: (0.25, 0.40, 0.95, 0.85),
-            2: (0.10, 0.75, 0.85, 0.80),
-            3: (0.85, 0.45, 0.20, 0.80),
-        }
-        fallback_colors = [
-            (0.70, 0.30, 0.90, 0.80),
-            (0.35, 0.85, 0.60, 0.80),
-            (0.90, 0.60, 0.25, 0.80),
-            (0.55, 0.25, 0.95, 0.80),
-        ]
-
-        labels = sorted(label for label in np.unique(manual_np) if label > 0)
-        for idx, label in enumerate(labels):
-            try:
-                surface = mesh_builder.mask_to_surface(
-                    manual_np,
-                    spacing=tuple(manual_img.GetSpacing()),
-                    origin=tuple(manual_img.GetOrigin()),
-                    label=label,
-                )
-                if not surface["vertices"].size:
-                    continue
-
-                display_name = f"Provided Mask {idx + 1}"
-                color = label_palette.get(label, fallback_colors[idx % len(fallback_colors)])
-                surface["display_name"] = display_name
-                surface["color"] = color
-                surfaces[f"manual_mask_{label}"] = surface
-            except ValueError:
-                pass
-
+    # 4) Optional export (only if liver is present)
     if export_path and "liver" in surfaces:
-        save_mesh(surfaces["liver"], export_path)
+        save_mesh(
+            {"vertices": surfaces["liver"]["vertices"], "faces": surfaces["liver"]["faces"], "color": surfaces["liver"]["color"]},
+            export_path,
+        )
+        log.info("[pipeline] exported liver mesh to %s", export_path)
 
-    return img, surfaces, result
+    # Maintain API compatibility: third return value is the mask image
+    return img, surfaces, mask_img
 
+# ---- CLI / Viewer -----------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser()
@@ -230,7 +290,7 @@ def main():
     p.add_argument("--series", help="SeriesInstanceUID within a DICOM folder", default=None)
     p.add_argument(
         "--liver-mask",
-        help="Path to precomputed liver mask (NIfTI). Skips TotalSegmentator.",
+        help="Path to precomputed liver mask (NIfTI). Required (no local segmentation).",
         default=None,
     )
     p.add_argument(
@@ -240,7 +300,7 @@ def main():
     )
     p.add_argument(
         "--task008-mask",
-        help="Path to nnU-Net v1 Task008 output (NIfTI).",
+        help="Path to nnU-Net Task008 output (NIfTI).",
         default=None,
     )
     p.add_argument(
@@ -323,12 +383,12 @@ def main():
         task008_mask_path=initial_task,
         manual_mask_path=initial_manual,
     )
-    print(f"[pipeline] method={result.used}, phase_hint={result.phase_hint}")
+    print("[pipeline] using provided masks")
 
     if not args.no_gui:
         from .viewer import HpbViewer
         initial_case = initial_case
-        case_cache: dict[str, tuple[sitk.Image, dict[str, dict[str, np.ndarray]], AutoLiverResult]] = {
+        case_cache: dict[str, tuple[sitk.Image, dict[str, dict[str, np.ndarray]], sitk.Image]] = {
             initial_case: (img, surfaces, result)
         }
         catalog_for_viewer = case_catalog if not args.no_browser else None
