@@ -182,6 +182,9 @@ class SidebarMixin:
             if layer is None:
                 continue
 
+            if name == "Hepatic Vessels Old":
+                layer.visible = False
+
             row = QFrame()
             row.setObjectName("SurfaceRow")
             row_layout = QHBoxLayout(row)
