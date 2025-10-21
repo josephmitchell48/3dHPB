@@ -24,13 +24,13 @@ RGBA = Tuple[float, float, float, float]
 # ---- Label/color config ------------------------------------------------------
 
 TASK08_LABELS: Dict[int, Tuple[str, RGBA]] = {
-    1: ("hepatic_vessels", (0.0, 0.0, 1.0, 1.0)),
+    1: ("hepatic_vessels_OLD", (0.0, 0.0, 1.0, 1.0)),
     2: ("liver_tumors",    (0.0, 1.0, 0.0, 1.0)),
 }
 
 VSNET_LABELS: Dict[int, Tuple[str, RGBA]] = {
-    1: ("pulmonary_vein", (0.25, 0.40, 0.95, 0.85)),
-    2: ("hepatic_vein",   (0.10, 0.75, 0.85, 0.80)),
+    1: ("hepatic_vein", (0.25, 0.40, 0.95, 0.85)),
+    2: ("portal_vein",   (0.10, 0.75, 0.85, 0.80)),
 }
 
 # ---- Core utilities ----------------------------------------------------------

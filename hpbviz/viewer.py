@@ -2,17 +2,15 @@
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
-from typing import Optional, Dict, Any, Callable, Tuple, List
+from typing import Optional, Dict, Any, Callable, Tuple
 
 import numpy as np
 import SimpleITK as sitk
 import napari
-from magicgui import magicgui
 from napari.utils.colormaps import Colormap
 from qtpy.QtCore import Qt, QSignalBlocker
-from qtpy.QtWidgets import QListWidget, QWidget, QVBoxLayout, QLabel, QFrame
+from qtpy.QtWidgets import QListWidget, QCheckBox, QPushButton
 
 _NAPARI_CACHE = Path.cwd() / ".napari_cache"
 _NAPARI_CACHE.mkdir(parents=True, exist_ok=True)
@@ -20,14 +18,14 @@ os.environ["NAPARI_CACHE_DIR"] = str(_NAPARI_CACHE)
 os.environ["NAPARI_CONFIG_DIR"] = str(_NAPARI_CACHE)
 os.environ["NAPARI_CONFIG"] = str(_NAPARI_CACHE)
 
-from .io import save_mesh
 from .mesh import MeshBuilder
+from .ui import SidebarMixin, ViewerActionsMixin, ThemeMixin
 
 
 CaseLoader = Callable[[str], Tuple[sitk.Image, Dict[str, Dict[str, np.ndarray]], Any]]
 
 
-class HpbViewer:
+class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
     def __init__(
         self,
         image: sitk.Image,
@@ -45,8 +43,8 @@ class HpbViewer:
         self.surface_layers: Dict[str, napari.layers.Surface] = {}
         self._surface_meshes_world: Dict[str, Dict[str, Any]] = {}
 
-        self._side_dock = None
-        self._case_list_widget: Optional[QListWidget] = None
+        self._side_docks: list[Any] = []
+        self._case_list_widgets: list[QListWidget] = []
         self._suppress_case_signal = False
 
         self.show_controls = bool(show_controls)
@@ -63,6 +61,10 @@ class HpbViewer:
 
         self.vol_layer = None
         self._mesher = MeshBuilder()
+        self._surface_toggle_widgets: Dict[str, list[QCheckBox]] = {}
+        self._volume_toggle_widgets: list[QCheckBox] = []
+        self._theme_buttons: list[QPushButton] = []
+        self._display_mode_buttons: list[QPushButton] = []
 
     # ---------- public entry points ----------
 
@@ -123,57 +125,51 @@ class HpbViewer:
             opacity=0.35,
             visible=True,
         )
+        self._apply_window_customizations()
 
     def _setup_side_panel(self) -> None:
         if self.viewer is None:
             return
 
-        if self._side_dock is not None:
-            try:
-                self.viewer.window.remove_dock_widget(self._side_dock)
-            except Exception:
-                pass
-            self._side_dock = None
-            self._case_list_widget = None
+        window = getattr(self.viewer, "window", None)
+        if window is None:
+            return
 
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        if self._side_docks:
+            for dock in list(self._side_docks):
+                try:
+                    window.remove_dock_widget(dock)
+                except Exception:
+                    pass
+            self._side_docks.clear()
 
-        if self.show_controls:
-            layout.addWidget(self._controls_widget())
+        self._case_list_widgets = []
+        self._volume_toggle_widgets = []
+        self._theme_buttons = []
+        self._display_mode_buttons = []
+        self._surface_toggle_widgets = {}
 
-        if self.case_catalog and self.case_loader:
-            if layout.count() > 0:
-                separator = QFrame()
-                separator.setFrameShape(QFrame.HLine)
-                separator.setFrameShadow(QFrame.Sunken)
-                layout.addWidget(separator)
+        left_widget = self._build_sidebar_widget(
+            include_controls=True,
+            include_surfaces=True,
+            include_cases=False,
+            header_title="HPB Navigator",
+        )
+        left_dock = window.add_dock_widget(left_widget, area="left")
+        self._configure_dock(left_dock, "HPB Navigator")
+        self._side_docks.append(left_dock)
 
-            layout.addWidget(QLabel("Patients"))
-            list_widget = QListWidget()
-            list_widget.setSelectionMode(QListWidget.SingleSelection)
-            list_widget.addItems(sorted(self.case_catalog.keys()))
-            list_widget.currentTextChanged.connect(self._on_case_selected)
-            self._case_list_widget = list_widget
-            layout.addWidget(list_widget)
+        right_widget = self._build_sidebar_widget(
+            include_controls=False,
+            include_surfaces=False,
+            include_cases=True,
+            header_title="Patient Library",
+        )
+        right_dock = window.add_dock_widget(right_widget, area="right")
+        self._configure_dock(right_dock, "Patient Library")
+        self._side_docks.append(right_dock)
 
-        self._side_dock = self.viewer.window.add_dock_widget(widget, area="right")
-
-        if self._case_list_widget is not None:
-            blocker = QSignalBlocker(self._case_list_widget)
-            try:
-                if self.current_case:
-                    matches = self._case_list_widget.findItems(self.current_case, Qt.MatchExactly)
-                    if matches:
-                        self._case_list_widget.setCurrentItem(matches[0])
-                    elif self._case_list_widget.count() > 0:
-                        self._case_list_widget.setCurrentRow(0)
-                elif self._case_list_widget.count() > 0:
-                    self._case_list_widget.setCurrentRow(0)
-            finally:
-                del blocker
+        self._sync_case_list_selection()
 
     def _add_surfaces(self, surfaces: Dict[str, Dict[str, Any]], clear_existing: bool = False) -> None:
         if self.viewer is None:
@@ -296,53 +292,49 @@ class HpbViewer:
         origin = tuple(float(v) for v in self.image_sitk.GetOrigin())
         return self._mesher.mask_to_surface(arr, spacing=(sx, sy, sz), origin=origin)
 
-    def _controls_widget(self) -> QWidget:
-        @magicgui(call_button="Center View")
-        def center_view():
-            self.viewer.dims.ndisplay = 3
-            self.viewer.reset_view()
+    def _apply_window_customizations(self) -> None:
+        if not self.viewer:
+            return
+        window = getattr(self.viewer, "window", None)
+        if window is None:
+            return
 
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.addWidget(center_view.native)
+        qt_viewer = getattr(window, "_qt_viewer", None)
+        if qt_viewer is None:
+            return
 
-        for name in self._sorted_layer_names():
-            mesh_world = self._surface_meshes_world.get(name)
-            if not mesh_world:
+        for dock_name in ("dockLayerList", "dockLayerControls"):
+            dock_widget = getattr(qt_viewer, dock_name, None)
+            if dock_widget is None:
                 continue
+            try:
+                dock_widget.setVisible(False)
+                window.remove_dock_widget(dock_widget)
+            except Exception:
+                pass
 
-            def make_export(mesh=mesh_world, display_name=name):
-                default_name = display_name.lower().replace(" ", "_") + ".obj"
+    def _configure_dock(self, dock_widget: Any, title: str) -> None:
+        if dock_widget is None:
+            return
+        try:
+            dock_widget.setWindowTitle(title)
+            dock_widget.setMinimumWidth(320)
+        except Exception:
+            pass
 
-                @magicgui(call_button=f"Export {display_name} Mesh")
-                def export(path: str = default_name):
-                    save_mesh(mesh, path)
-                    print(f"Saved {path}")
-
-                return export
-
-            layout.addWidget(make_export().native)
-
-        return widget
-
-    def _world_to_data_coords(self, verts_xyz: np.ndarray) -> np.ndarray:
-        if verts_xyz.size == 0:
-            return verts_xyz
-
-        rel = verts_xyz.astype(np.float64) - self.origin_xyz
-        aligned = self.direction.T @ rel.T
-        spacing = np.array(self.spacing_xyz, dtype=np.float64)
-        idx = (aligned.T / spacing).astype(np.float32)
-        return idx[:, [2, 1, 0]]
-
-    def _volume_layer_name(self) -> str:
-        if self.current_case:
-            return f"{self.volume_name} ({self.current_case})"
-        return self.volume_name
-
-    def _sorted_layer_names(self) -> List[str]:
-        def sort_key(name: str):
-            parts = re.split(r"(\d+)", name)
-            return [int(part) if part.isdigit() else part.lower() for part in parts]
-
-        return sorted(self.surface_layers.keys(), key=sort_key)
+    def _sync_case_list_selection(self) -> None:
+        if not self._case_list_widgets:
+            return
+        for widget in self._case_list_widgets:
+            blocker = QSignalBlocker(widget)
+            try:
+                if self.current_case:
+                    matches = widget.findItems(self.current_case, Qt.MatchExactly)
+                    if matches:
+                        widget.setCurrentItem(matches[0])
+                    elif widget.count() > 0:
+                        widget.setCurrentRow(0)
+                elif widget.count() > 0:
+                    widget.setCurrentRow(0)
+            finally:
+                del blocker
