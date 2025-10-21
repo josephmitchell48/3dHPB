@@ -5,6 +5,11 @@
 # Datasets & generated assets
 /data/
 
+# Local caches
+/.napari_cache
+/hpbviz/__pycache__
+/hpbviz/ui/__pycache__
+
 # Legacy local caches (keep ignored if regenerated)
 /.nnunet/
 /.totalseg_cache/
