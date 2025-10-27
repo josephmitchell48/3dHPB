@@ -1,4 +1,5 @@
 ### Run App (With Data in data/) ###
+source .venv/bin/activate
 python -m hpbviz.app
 
 --no-gui
@@ -18,9 +19,11 @@ python -m hpbviz.remote_client \
 # Connect to aws
 ssh -i ./security/3dhpb-key.pem ubuntu@3.85.4.178
 
-source ~/.hpb/bin/activate
+source ~/.venv/bin/activate
 export RESULTS_FOLDER=/models/results_v1
 uvicorn server:app --host 0.0.0.0 --port 8080
+
+source ~/.hpb/bin/activate
 
 sudo shutdown -h now
 

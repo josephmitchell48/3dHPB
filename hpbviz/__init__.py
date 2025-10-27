@@ -8,4 +8,5 @@ __all__ = [
     "app",
     "remote",
     "remote_client",
+    "metrics",
 ]

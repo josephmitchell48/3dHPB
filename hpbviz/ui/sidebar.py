@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import Dict, Optional, TYPE_CHECKING, Callable, Any, List, Tuple
 
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QListWidget,
+    QListWidgetItem,
     QWidget,
     QVBoxLayout,
     QLabel,
@@ -36,6 +38,7 @@ class SidebarMixin:
     _case_list_widgets: List[QListWidget]
     _side_docks: List[Any]
     vol_layer: Optional["Layer"]
+    current_metrics: Optional[Dict[str, Any]]
 
     def _build_sidebar_widget(
         self,
@@ -43,6 +46,7 @@ class SidebarMixin:
         include_controls: bool = True,
         include_surfaces: bool = True,
         include_cases: bool = True,
+        include_metrics: bool = False,
         header_title: str = "HPB Visualizer",
     ) -> QWidget:
         root = QWidget()
@@ -81,6 +85,11 @@ class SidebarMixin:
             surfaces, surface_handles = self._build_surface_section()
             layout.addWidget(surfaces)
             self._merge_sidebar_handles(handles, surface_handles)
+
+        if include_metrics:
+            metrics_widget = self._build_metrics_section()
+            if metrics_widget is not None:
+                layout.addWidget(metrics_widget)
 
         if include_cases and self.case_catalog and self.case_loader:
             cases, case_handles = self._build_case_section()
@@ -159,6 +168,62 @@ class SidebarMixin:
 
         return section, handles
 
+    def _build_metrics_section(self) -> Optional[QWidget]:
+        metrics = getattr(self, "current_metrics", None)
+        section = QFrame()
+        section.setObjectName("SidebarSection")
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(18, 20, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("Tumour Metrics")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+
+        if not metrics:
+            empty = QLabel("No tumour metrics available.")
+            empty.setObjectName("SectionHint")
+            empty.setWordWrap(True)
+            layout.addWidget(empty)
+            return section
+
+        total_mm3 = float(metrics.get("total_mm3", 0.0))
+        total_ml = float(metrics.get("total_ml", total_mm3 / 1000.0 if total_mm3 else 0.0))
+        summary = QLabel(f"Total Volume: {total_ml:.2f} mL ({total_mm3:.0f} mm³)")
+        summary.setObjectName("SectionHint")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        components = metrics.get("components") or []
+        if not components:
+            none_label = QLabel("No individual tumours detected.")
+            none_label.setObjectName("SectionHint")
+            none_label.setWordWrap(True)
+            layout.addWidget(none_label)
+            return section
+
+        for idx, comp in enumerate(components, start=1):
+            if isinstance(comp, dict):
+                volume_ml = float(comp.get("volume_ml", 0.0))
+                volume_mm3 = float(comp.get("volume_mm3", volume_ml * 1000.0))
+                voxels = int(comp.get("voxel_count", 0))
+                label_id = comp.get("label_id", idx)
+            else:
+                volume_ml = float(getattr(comp, "volume_ml", 0.0))
+                volume_mm3 = float(getattr(comp, "volume_mm3", volume_ml * 1000.0))
+                voxels = int(getattr(comp, "voxel_count", 0))
+                label_id = getattr(comp, "label_id", idx)
+
+            desc = QLabel(
+                f"Tumour {idx} (label {label_id}): {volume_ml:.2f} mL "
+                f"({volume_mm3:.0f} mm³, {voxels} voxels)"
+            )
+            desc.setObjectName("SectionHint")
+            desc.setWordWrap(True)
+            layout.addWidget(desc)
+
+        return section
+
     def _build_surface_section(self) -> Tuple[QWidget, Dict[str, List[Any]]]:
         section = QFrame()
         section.setObjectName("SidebarSection")
@@ -230,8 +295,17 @@ class SidebarMixin:
         list_widget = QListWidget()
         list_widget.setObjectName("CaseList")
         list_widget.setSelectionMode(QListWidget.SingleSelection)
-        list_widget.addItems(sorted(self.case_catalog.keys()))
-        list_widget.currentTextChanged.connect(self._on_case_selected)
+        case_names = sorted(self.case_catalog.keys(), key=self._natural_sort_key)
+        print("[sidebar] building case list:", case_names)
+        list_widget.blockSignals(True)
+        for case_name in case_names:
+            sort_key = self._natural_sort_key(case_name)
+            print(f"[sidebar] add item '{case_name}' sort_key={sort_key}")
+            item = QListWidgetItem(case_name)
+            item.setData(Qt.UserRole, case_name)
+            list_widget.addItem(item)
+        list_widget.blockSignals(False)
+        list_widget.currentItemChanged.connect(self._on_case_item_changed)
         layout.addWidget(list_widget)
 
         handles = self._empty_sidebar_handles()
@@ -270,3 +344,45 @@ class SidebarMixin:
             self._surface_toggle_widgets.setdefault(name, []).append(toggle)
         self._update_theme_button_text()
         self._update_display_button_text()
+
+    def _on_case_item_changed(
+        self,
+        current: Optional[QListWidgetItem],
+        previous: Optional[QListWidgetItem],
+    ) -> None:
+        current_name = current.data(Qt.UserRole) if current else None
+        previous_name = previous.data(Qt.UserRole) if previous else None
+        widget = current.listWidget() if current else (previous.listWidget() if previous else None)
+        has_focus = widget.hasFocus() if widget else False
+        print(
+            f"[sidebar] item changed: previous={previous_name} current={current_name} "
+            f"focus={has_focus}"
+        )
+        if current is None:
+            print("[sidebar] current item is None, ignoring")
+            return
+        case_name = current.data(Qt.UserRole)
+        if case_name is None:
+            case_name = current.text()
+        if not case_name:
+            print("[sidebar] case_name empty, ignoring")
+            return
+        if widget and not widget.hasFocus():
+            print(f"[sidebar] ignoring non-focused change to {case_name}")
+            return
+        print(f"[sidebar] dispatch _on_case_selected('{case_name}')")
+        self._on_case_selected(str(case_name))
+
+    def _find_case_item(self, widget: QListWidget, case_name: str) -> Optional[QListWidgetItem]:
+        for idx in range(widget.count()):
+            item = widget.item(idx)
+            value = item.data(Qt.UserRole)
+            if value is None:
+                value = item.text()
+            if str(value) == case_name:
+                return item
+        return None
+
+    def _natural_sort_key(self, value: str) -> Tuple[Any, ...]:
+        parts = re.split(r"(\d+)", value)
+        return tuple(int(part) if part.isdigit() else part.lower() for part in parts)

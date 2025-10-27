@@ -2,13 +2,14 @@ import argparse
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 
 import SimpleITK as sitk
 import numpy as np
 
 from .mesh import MeshBuilder
 from .io import load_dicom_series, save_mesh, list_dicom_series
+from .metrics import tumor_volume_summary
 
 log = logging.getLogger("hpbviz.pipeline")
 if not log.handlers:
@@ -220,7 +221,7 @@ def run_pipeline(
 ):
     """
     Run meshing pipeline with provided masks (no local segmentation).
-    Returns: (img, surfaces, mask_img) for viewer compatibility.
+    Returns: (img, surfaces, mask_img, tumor_metrics) for viewer compatibility.
     """
     # 1) Load & canonicalize reference image once
     img = _canonicalize_image(load_dicom_series(input_path, series_uid=series_uid))
@@ -246,6 +247,7 @@ def run_pipeline(
         log.info("[pipeline] liver surface empty")
 
     # Task08 (optional)
+    tumor_metrics: Optional[Dict[str, Any]] = None
     _add_labeled_surfaces(
         mesh_builder=mesh_builder,
         ref_img=img,
@@ -255,6 +257,47 @@ def run_pipeline(
         log_tag="Task08",
         set_display_name=True,  # keep previous behavior
     )
+
+    if task008_mask_path:
+        try:
+            task_mask_img = _read_mask_like(img, task008_mask_path)
+            components, total_mm3, total_ml = tumor_volume_summary(
+                task_mask_img,
+                label_value=2,
+                connectivity=26,
+            )
+            print(f"[metrics] computed for {task008_mask_path}: {len(components)} components, {total_ml:.2f} mL total")
+            tumor_metrics = {
+                "components": [
+                    {
+                        "label_id": comp.label_id,
+                        "voxel_count": comp.voxel_count,
+                        "volume_mm3": comp.volume_mm3,
+                        "volume_ml": comp.volume_ml,
+                    }
+                    for comp in components
+                ],
+                "total_mm3": total_mm3,
+                "total_ml": total_ml,
+            }
+
+            # comps = tumor_metrics["components"]
+            # if comps:
+            #     print("[metrics] liver tumour volumes:")
+            #     for idx, comp in enumerate(comps, start=1):
+            #         label_id = comp.get("label_id", idx)
+            #         print(
+            #             f"  component {label_id}: "
+            #             f"{comp.get('voxel_count', 0)} voxels, "
+            #             f"{comp.get('volume_mm3', 0.0):.2f} mm^3 "
+            #             f"({comp.get('volume_ml', 0.0):.2f} mL)"
+            #         )
+            #     print(f"[metrics] total tumour volume: {total_mm3:.2f} mm^3 ({total_ml:.2f} mL)")
+            # else:
+            #     print("[metrics] liver tumour volumes: no tumours detected in mask")
+        except Exception as exc:
+            print(f"[metrics] failed to compute tumour volume: {exc}")
+            tumor_metrics = None
 
     # VSNet/manual (optional)
     _add_labeled_surfaces(
@@ -276,7 +319,7 @@ def run_pipeline(
         log.info("[pipeline] exported liver mesh to %s", export_path)
 
     # Maintain API compatibility: third return value is the mask image
-    return img, surfaces, mask_img
+    return img, surfaces, mask_img, tumor_metrics
 
 # ---- CLI / Viewer -----------------------------------------------------------
 
@@ -374,7 +417,7 @@ def main():
                 print("  -", name)
         return
 
-    img, surfaces, result = run_pipeline(
+    img, surfaces, result, tumor_metrics = run_pipeline(
         entry["dicom_path"],
         args.export,
         series_uid=args.series,
@@ -388,8 +431,8 @@ def main():
     if not args.no_gui:
         from .viewer import HpbViewer
         initial_case = initial_case
-        case_cache: dict[str, tuple[sitk.Image, dict[str, dict[str, np.ndarray]], sitk.Image]] = {
-            initial_case: (img, surfaces, result)
+        case_cache: dict[str, tuple[sitk.Image, dict[str, dict[str, np.ndarray]], sitk.Image, Optional[Dict[str, Any]]]] = {
+            initial_case: (img, surfaces, result, tumor_metrics)
         }
         catalog_for_viewer = case_catalog if not args.no_browser else None
         case_loader = None
@@ -403,7 +446,7 @@ def main():
                 info = catalog_for_viewer.get(name)
                 if not info:
                     raise RuntimeError(f"No case data available for {name}")
-                return run_pipeline(
+                data = run_pipeline(
                     info["dicom_path"],
                     export_path=None,
                     series_uid=None,
@@ -412,6 +455,8 @@ def main():
                     task008_mask_path=info.get("task008_mask"),
                     manual_mask_path=info.get("manual_mask"),
                 )
+                case_cache[name] = data
+                return data
 
             case_loader = _load_case
 
@@ -421,8 +466,9 @@ def main():
             case_catalog=catalog_for_viewer,
             case_loader=case_loader,
             current_case=initial_case,
+            current_metrics=tumor_metrics,
         )
-        viewer.show_with_surfaces(surfaces)
+        viewer.show_with_surfaces(surfaces, metrics=tumor_metrics)
 
 
 if __name__ == "__main__":

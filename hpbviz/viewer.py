@@ -9,8 +9,8 @@ import numpy as np
 import SimpleITK as sitk
 import napari
 from napari.utils.colormaps import Colormap
-from qtpy.QtCore import Qt, QSignalBlocker
-from qtpy.QtWidgets import QListWidget, QCheckBox, QPushButton
+from qtpy.QtCore import Qt, QSignalBlocker, QTimer
+from qtpy.QtWidgets import QListWidget, QCheckBox, QPushButton, QListWidgetItem
 
 _NAPARI_CACHE = Path.cwd() / ".napari_cache"
 _NAPARI_CACHE.mkdir(parents=True, exist_ok=True)
@@ -22,7 +22,10 @@ from .mesh import MeshBuilder
 from .ui import SidebarMixin, ViewerActionsMixin, ThemeMixin
 
 
-CaseLoader = Callable[[str], Tuple[sitk.Image, Dict[str, Dict[str, np.ndarray]], Any]]
+CaseLoader = Callable[
+    [str],
+    Tuple[sitk.Image, Dict[str, Dict[str, np.ndarray]], Any, Optional[Dict[str, Any]]],
+]
 
 
 class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
@@ -34,6 +37,7 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
         case_catalog: Optional[Dict[str, Dict[str, str]]] = None,
         case_loader: Optional[CaseLoader] = None,
         current_case: Optional[str] = None,
+        current_metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.image_sitk = image
         self.volume_name = volume_name
@@ -46,6 +50,8 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
         self._side_docks: list[Any] = []
         self._case_list_widgets: list[QListWidget] = []
         self._suppress_case_signal = False
+        self._case_metrics: Dict[str, Optional[Dict[str, Any]]] = {}
+        self.current_metrics: Optional[Dict[str, Any]] = current_metrics
 
         self.show_controls = bool(show_controls)
         self.case_catalog = case_catalog or {}
@@ -66,6 +72,9 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
         self._theme_buttons: list[QPushButton] = []
         self._display_mode_buttons: list[QPushButton] = []
 
+        if self.current_case is not None:
+            self._case_metrics[self.current_case] = current_metrics
+
     # ---------- public entry points ----------
 
     def show(self) -> None:
@@ -76,9 +85,14 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
     def show_with_surfaces(
         self,
         surfaces: Dict[str, Dict[str, Any]],
+        metrics: Optional[Dict[str, Any]] = None,
         build_abdomen: bool = True,
         hide_volume: bool = False,
     ) -> None:
+        self.current_metrics = metrics
+        if self.current_case:
+            self._case_metrics[self.current_case] = metrics
+
         self._ensure_viewer()
 
         self._add_surfaces(surfaces, clear_existing=True)
@@ -149,10 +163,13 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
         self._display_mode_buttons = []
         self._surface_toggle_widgets = {}
 
+        include_cases = bool(self.case_catalog and self.case_loader)
+
         left_widget = self._build_sidebar_widget(
             include_controls=True,
             include_surfaces=True,
             include_cases=False,
+            include_metrics=False,
             header_title="HPB Navigator",
         )
         left_dock = window.add_dock_widget(left_widget, area="left")
@@ -162,7 +179,8 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
         right_widget = self._build_sidebar_widget(
             include_controls=False,
             include_surfaces=False,
-            include_cases=True,
+            include_cases=include_cases,
+            include_metrics=True,
             header_title="Patient Library",
         )
         right_dock = window.add_dock_widget(right_widget, area="right")
@@ -184,6 +202,8 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
             self.surface_layers.clear()
             self._surface_meshes_world.clear()
 
+        priority_layers: list[napari.layers.Surface] = []
+
         for key, surface in surfaces.items():
             if not surface:
                 continue
@@ -195,6 +215,7 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
             display_name = surface.get("display_name") or key.replace("_", " ").title()
             opacity = surface.get("opacity", 0.9)
             shading = surface.get("shading", "smooth")
+            blending = surface.get("blending", "translucent_no_depth")
 
             values = surface.get("values")
             if values is None:
@@ -209,9 +230,14 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
                 name=display_name,
                 opacity=opacity,
                 shading=shading,
-                blending="translucent_no_depth",
+                blending=blending,
             )
             layer.scale = self.spacing_zyx
+
+            if display_name == "Liver Tumors":
+                layer.opacity = 1.0
+                layer.blending = "opaque"
+                priority_layers.append(layer)
 
             color = surface.get("color")
             if color is not None:
@@ -241,15 +267,31 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
                 "faces": faces,
             }
 
+        if priority_layers:
+            layers_list = self.viewer.layers
+            for layer in priority_layers:
+                try:
+                    current_index = layers_list.index(layer)
+                    layers_list.move(current_index, len(layers_list) - 1)
+                except ValueError:
+                    continue
+
     def _on_case_selected(self, case_name: str) -> None:
         if self._suppress_case_signal:
+            print(f"[viewer] suppressing case selection for {case_name}")
             return
-        if not case_name or case_name == self.current_case:
+        if not case_name:
+            print("[viewer] case_name empty, ignoring")
+            return
+        if case_name == self.current_case:
+            print(f"[viewer] case '{case_name}' already current, ignoring")
             return
         if not self.case_loader:
+            print(f"[viewer] no case_loader set; cannot load {case_name}")
             return
+        print(f"[viewer] loading case {case_name}")
         try:
-            img, surfaces, _ = self.case_loader(case_name)
+            img, surfaces, _mask, metrics = self.case_loader(case_name)
         except Exception as exc:
             print(f"[viewer] failed to load case {case_name}: {exc}")
             return
@@ -257,6 +299,8 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
         self.current_case = case_name
         self.image_sitk = img
         self._volume_data = sitk.GetArrayFromImage(img).astype(np.float32)
+        self.current_metrics = metrics
+        self._case_metrics[case_name] = metrics
         sx, sy, sz = img.GetSpacing()
         self.spacing_xyz = (float(sx), float(sy), float(sz))
         self.spacing_zyx = (float(sz), float(sy), float(sx))
@@ -272,9 +316,20 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
 
         self._suppress_case_signal = True
         try:
+            print(f"[viewer] reconfiguring side panels for case {case_name}")
             self._setup_side_panel()
         finally:
-            self._suppress_case_signal = False
+            def _sync_only():
+                print(f"[viewer] finished loading {case_name}")
+                self._sync_case_list_selection()
+
+                def _release():
+                    self._suppress_case_signal = False
+                    print(f"[viewer] case selection re-enabled for {case_name}")
+
+                QTimer.singleShot(150, _release)
+
+            QTimer.singleShot(0, _sync_only)
 
     def _build_abdomen_surface(self) -> Optional[Dict[str, Any]]:
         img = sitk.Cast(self.image_sitk, sitk.sitkInt16)
@@ -329,12 +384,12 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
             blocker = QSignalBlocker(widget)
             try:
                 if self.current_case:
-                    matches = widget.findItems(self.current_case, Qt.MatchExactly)
-                    if matches:
-                        widget.setCurrentItem(matches[0])
-                    elif widget.count() > 0:
-                        widget.setCurrentRow(0)
+                    item = self._find_case_item(widget, self.current_case)
+                    print(f"[viewer] sync selection: current_case={self.current_case} item_found={bool(item)}")
+                    if item is not None:
+                        widget.setCurrentItem(item)
                 elif widget.count() > 0:
+                    print("[viewer] no current case, selecting first row")
                     widget.setCurrentRow(0)
             finally:
                 del blocker
