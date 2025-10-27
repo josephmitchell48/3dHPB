@@ -2,7 +2,7 @@ import argparse
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 import SimpleITK as sitk
 import numpy as np
@@ -167,43 +167,69 @@ def _discover_cases(raw_root: str, output_root: str) -> dict[str, dict[str, str]
     raw_root_path = Path(raw_root).expanduser()
     output_root_path = Path(output_root).expanduser()
 
+    def _register_case(
+        case: str,
+        *,
+        volume: Optional[Path] = None,
+        liver: Optional[Path] = None,
+        task: Optional[Path] = None,
+        manual: Optional[Path] = None,
+    ) -> None:
+        entry = cases.setdefault(case, {})
+        if volume and "dicom_path" not in entry:
+            entry["dicom_path"] = str(volume.resolve())
+        if liver:
+            entry["liver_mask"] = str(liver.resolve())
+        if task:
+            entry["task008_mask"] = str(task.resolve())
+        if manual:
+            entry["manual_mask"] = str(manual.resolve())
+
+    def _pick_volume_candidate(files: List[Path]) -> Optional[Path]:
+        mask_tokens = ("mask", "liver", "task008", "hepatic", "tumor", "vsnet", "seg", "label", "manual")
+        for candidate in files:
+            name = candidate.name.lower()
+            if not any(token in name for token in mask_tokens):
+                return candidate
+        return files[0] if files else None
+
+    if output_root_path.is_dir():
+        for out_entry in output_root_path.iterdir():
+            if out_entry.is_dir():
+                nii_files = sorted(out_entry.glob("*.nii*"))
+                liver_mask = None
+                task008_mask = None
+                manual_mask = None
+                for candidate in nii_files:
+                    name_lower = candidate.name.lower()
+                    if "liver" in name_lower and liver_mask is None:
+                        liver_mask = candidate
+                    elif (
+                        "task008" in name_lower or "tumor" in name_lower
+                    ) and task008_mask is None:
+                        task008_mask = candidate
+                    elif (
+                        "vsnet" in name_lower or "inputvsnet" in name_lower or "manual" in name_lower
+                    ) and manual_mask is None:
+                        manual_mask = candidate
+                base = _pick_volume_candidate(nii_files)
+                case = _case_name_from_path(out_entry.name)
+                _register_case(case, volume=base, liver=liver_mask, task=task008_mask, manual=manual_mask)
+            elif out_entry.suffix in {".nii", ".gz"}:
+                case = _case_name_from_path(out_entry.name)
+                _register_case(case, volume=out_entry)
+
     if raw_root_path.is_dir():
         for raw_entry in raw_root_path.iterdir():
             if raw_entry.is_dir():
                 nii_files = sorted(raw_entry.glob("*.nii*"))
-                chosen: Optional[Path] = None
-                if nii_files:
-                    chosen = next((p for p in nii_files if "mask" not in p.name.lower()), nii_files[0])
+                chosen = _pick_volume_candidate(nii_files)
                 case = _case_name_from_path(raw_entry.name)
                 target = chosen or raw_entry
-                cases.setdefault(case, {})["dicom_path"] = str(target.resolve())
+                _register_case(case, volume=target)
             elif raw_entry.suffix in {".nii", ".gz"}:
                 case = _case_name_from_path(raw_entry.name)
-                cases.setdefault(case, {})["dicom_path"] = str(raw_entry.resolve())
-
-    if output_root_path.is_dir():
-        for out_dir in output_root_path.iterdir():
-            if not out_dir.is_dir():
-                continue
-            case = out_dir.name
-            liver_mask = None
-            task008_mask = None
-            manual_mask = None
-            for candidate in out_dir.glob("*.nii*"):
-                name_lower = candidate.name.lower()
-                if "liver" in name_lower and liver_mask is None:
-                    liver_mask = str(candidate.resolve())
-                elif ("task008" in name_lower or "hepatic" in name_lower or "tumor" in name_lower) and task008_mask is None:
-                    task008_mask = str(candidate.resolve())
-                elif ("vsnet" in name_lower or "inputvsnet" in name_lower) and manual_mask is None:
-                    manual_mask = str(candidate.resolve())
-            entry = cases.setdefault(case, {})
-            if liver_mask:
-                entry["liver_mask"] = liver_mask
-            if task008_mask:
-                entry["task008_mask"] = task008_mask
-            if manual_mask:
-                entry["manual_mask"] = manual_mask
+                _register_case(case, volume=raw_entry)
 
     return {case: info for case, info in cases.items() if info.get("dicom_path")}
 
@@ -311,12 +337,12 @@ def main():
     p.add_argument(
         "--raw-root",
         default="data/awsInput",
-        help="Root directory containing prepared cases (folders or NIfTI files)",
+        help="Fallback directory containing input volumes (folders or NIfTI files)",
     )
     p.add_argument(
         "--output-root",
         default="data/awsOutput",
-        help="Root directory containing segmentation outputs for case browsing",
+        help="Primary directory containing processed cases and masks for browsing",
     )
     p.add_argument("--list-series", action="store_true", help="List DICOM series in the given folder and exit")
     args = p.parse_args()

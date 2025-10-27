@@ -112,7 +112,17 @@ class HpbViewer(SidebarMixin, ViewerActionsMixin, ThemeMixin):
         if self._volume_data is None:
             self._volume_data = sitk.GetArrayFromImage(self.image_sitk).astype(np.float32)
         vol = self._volume_data
-        vmin, vmax = np.percentile(vol, (5, 95))
+        finite = vol[np.isfinite(vol)]
+        if finite.size == 0:
+            vmin, vmax = 0.0, 1.0
+        else:
+            vmin, vmax = np.percentile(finite, (5, 95))
+            if not np.isfinite(vmin) or not np.isfinite(vmax):
+                vmin, vmax = float(finite.min()), float(finite.max())
+            else:
+                vmin, vmax = float(vmin), float(vmax)
+            if vmin == vmax:
+                vmax = vmin + 1.0
 
         self.viewer = napari.Viewer()
         self.vol_layer = self.viewer.add_image(
