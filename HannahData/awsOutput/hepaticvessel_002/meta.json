@@ -1,0 +1,30 @@
+{
+  "case_id": "hepaticvessel_002",
+  "source": "/Users/josephmitchell/dev/repos/VSNet/Task08_HepaticVessel/imagesTr/hepaticvessel_002.nii.gz",
+  "spacing": [
+    0.9511719942092896,
+    0.9511719942092896,
+    3.75
+  ],
+  "origin": [
+    486.04888916015625,
+    486.04888916015625,
+    0.0
+  ],
+  "direction": [
+    -1.0,
+    0.0,
+    0.0,
+    0.0,
+    -1.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "size": [
+    512,
+    512,
+    66
+  ]
+}
